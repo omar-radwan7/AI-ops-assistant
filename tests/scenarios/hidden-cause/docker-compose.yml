@@ -1,0 +1,14 @@
+# Test app for the AI investigation. The api only says "session store unavailable",
+# which names no service, so the rules cannot link it to the real cause in "cache".
+name: demo-hidden-cause
+services:
+  cache:
+    image: python:3.12-alpine
+    network_mode: none
+    command: ["python", "-c", "print('cache: loading config'); print('cache: Error: max_memory_mb is 0, must be at least 64'); raise SystemExit(2)"]
+    restart: "no"
+  api:
+    image: python:3.12-alpine
+    network_mode: none
+    command: ["python", "-c", "import time; print('api: starting on port 8080'); time.sleep(1); print('api: fatal: session store unavailable, giving up'); raise SystemExit(1)"]
+    restart: on-failure

@@ -1,0 +1,525 @@
+{
+  "id": "aiOpsAlertTriage",
+  "name": "AI Ops: alert triage",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "alert",
+        "options": {}
+      },
+      "id": "n1",
+      "name": "Alert from Alertmanager",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "ai-ops-alert"
+    },
+    {
+      "parameters": {},
+      "id": "n2",
+      "name": "Test alert (manual)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// A realistic test alert, so the workflow can be run without waiting for a real one.\nreturn [{ json: { body: { alerts: [{\n  status: 'firing',\n  labels: { alertname: 'DiskAlmostFull', instance: '127.0.0.1:9100', severity: 'critical' },\n  annotations: { summary: 'Root disk above 95% on 127.0.0.1:9100', description: 'The root filesystem is almost full.' },\n  startsAt: new Date().toISOString(),\n  fingerprint: 'manual-test',\n}]}}}];"
+      },
+      "id": "n3",
+      "name": "Sample alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turns the Alertmanager payload into one item per alert (firing or resolved).\n// For each alert it picks the metric to look up and the runbook to use.\nconst RUNBOOKS = {\n  \"DiskAlmostFull\": \"# Runbook: Disk almost full\\n1. Find the biggest folders: `sudo du -xh / --max-depth=2 | sort -rh | head -20`.\\n2. Check logs and old journals: `/var/log`, `journalctl --disk-usage`, then `sudo journalctl --vacuum-size=500M`.\\n3. Remove unused container images: `docker image prune` (only dangling images).\\n4. Clear package and tool caches (apt, pip, browser test caches) if they are large.\\n5. If nothing can be removed, plan more disk space and tell the service owner.\",\n  \"HighCPU\": \"# Runbook: High CPU\\n1. Find the processes using the most CPU: `top -o %CPU` or `ps aux --sort=-%cpu | head`.\\n2. Check if a known batch job, backup or build is running and when it ends.\\n3. If one process is stuck in a loop, restart that service, not the whole server.\\n4. If load is real customer traffic, scale out or move workloads.\",\n  \"HighMemory\": \"# Runbook: High memory\\n1. Find the processes using the most memory: `ps aux --sort=-%mem | head`.\\n2. Check for a memory leak: does one process grow steadily over hours?\\n3. Restart the leaking service during a quiet time and open a bug for its owner.\\n4. Check swap usage: heavy swapping makes the whole server slow.\",\n  \"ServiceDown\": \"# Runbook: Service down\\n1. Check if the process or container is running: `docker ps -a` or `systemctl status <service>`.\\n2. Read the last log lines: `docker logs --tail 100 <container>` or `journalctl -u <service> -n 100`.\\n3. Restart the service once. If it stops again, do not loop restarts: escalate to the owner.\\n4. Check dependencies: database, disk space, network, expired certificates.\"\n};\nconst QUERIES = {\n  HighCPU: '100 - avg(rate(node_cpu_seconds_total{mode=\"idle\"}[1m])) * 100',\n  HighMemory: '(1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100',\n  DiskAlmostFull: '(1 - node_filesystem_avail_bytes{mountpoint=\"/\",fstype!~\"tmpfs|overlay\"} / node_filesystem_size_bytes{mountpoint=\"/\",fstype!~\"tmpfs|overlay\"}) * 100',\n  ServiceDown: 'up{job=\"shop\"}',\n};\nconst LABELS = {\n  HighCPU: 'CPU usage in %',\n  HighMemory: 'memory usage in %',\n  DiskAlmostFull: 'root disk usage in %',\n  ServiceDown: 'service status (1 = up, 0 = down)',\n};\nconst first = $input.first().json;\nconst body = first.body ?? first;\nconst alerts = body.alerts || [];\nreturn alerts.map(a => ({ json: {\n  status: a.status,\n  alertname: a.labels.alertname,\n  instance: a.labels.instance || '',\n  service: a.labels.job || '',\n  severity: a.labels.severity || '',\n  summary: (a.annotations && a.annotations.summary) || '',\n  description: (a.annotations && a.annotations.description) || '',\n  startsAt: a.startsAt,\n  fingerprint: a.fingerprint || '',\n  expr: QUERIES[a.labels.alertname] || 'vector(0)',\n  metric_label: LABELS[a.labels.alertname] || 'metric value',\n  runbook: RUNBOOKS[a.labels.alertname] || 'No runbook found for this alert.',\n}}));"
+      },
+      "id": "n4",
+      "name": "Prepare",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "url": "http://127.0.0.1:9090/api/v1/query",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "query",
+              "value": "={{ $json.expr }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "n5",
+      "name": "Metric now",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1320,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "http://127.0.0.1:9090/api/v1/query",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "query",
+              "value": "={{ $('Prepare').item.json.expr }}"
+            },
+            {
+              "name": "time",
+              "value": "={{ Math.floor(Date.now() / 1000) - 3600 }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "n6",
+      "name": "Metric 1 hour ago",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1540,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const a = $('Prepare').item.json;\nconst value = r => (r && r.data && r.data.result && r.data.result[0]) ? Number(r.data.result[0].value[1]) : null;\nconst round = v => v === null || Number.isNaN(v) ? null : Math.round(v * 10) / 10;\nconst now = round(value($('Metric now').item.json));\nconst ago = round(value($json));\n\n// Describe the change over the last hour in one sentence.\nlet trend;\nconst state = v => (v === 1 ? 'up' : 'down');\nif (now === null) trend = 'The current value could not be read.';\nelse if (a.alertname === 'ServiceDown') trend = ago === null\n  ? `The service is ${state(now)} now. There is no value from 1 hour ago.`\n  : `The service is ${state(now)} now and was ${state(ago)} one hour ago.`;\nelse if (ago === null) trend = `The value is ${now} now. There is no value from 1 hour ago, so it is unknown how long this has lasted.`;\nelse if (Math.abs(now - ago) < 2) trend = `The value has stayed about the same for the last hour (${ago} then, ${now} now).`;\nelse if (now > ago) trend = `The value rose from ${ago} one hour ago to ${now} now, so the problem started within the last hour.`;\nelse trend = `The value fell from ${ago} one hour ago to ${now} now.`;\n\nreturn { json: { ...a, metric_now: now, metric_1h_ago: ago, trend } };",
+        "mode": "runOnceForEachItem"
+      },
+      "id": "n7",
+      "name": "Build context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://127.0.0.1:11434/api/generate",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'qwen2.5:3b', stream: false, format: 'json', options: { temperature: 0.2 }, prompt: 'You help the on-call engineer of a data center team. Write a short incident report for this alert. Use only the facts below. If the facts are not enough to know the cause, say so. Do not say how long the problem has lasted unless the trend sentence says it.\\n\\n' + 'Alert: ' + $json.alertname + '\\nSeverity: ' + $json.severity + '\\nAffected service: ' + $json.service + '\\nServer: ' + $json.instance + '\\nAlert text: ' + $json.summary + '. ' + $json.description + '\\nMetric: ' + $json.metric_label + '\\nTrend: ' + $json.trend + '\\n\\nRunbook:\\n' + $json.runbook + '\\n\\nAnswer as JSON with these keys: priority (P1 = act now, P2 = today, P3 = can wait), summary (one sentence), likely_cause (one or two sentences, based on the trend), first_steps (a list of up to 3 short steps taken from the runbook).' }) }}",
+        "options": {
+          "timeout": 180000
+        }
+      },
+      "id": "n8",
+      "name": "LLM incident report (Ollama)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1980,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const a = $('Build context').item.json;\nlet r = {};\ntry { r = JSON.parse($json.response); } catch (e) { r = { likely_cause: 'The model did not return valid JSON.' }; }\nconst steps = Array.isArray(r.first_steps)\n  ? r.first_steps.map((s, i) => `${i + 1}. ${typeof s === 'string' ? s : JSON.stringify(s)}`).join('\\n')\n  : String(r.first_steps || '');\n// The model suggests a priority, but a fixed rule sets the limit:\n// only critical alerts may be P1, warnings are at most P2.\nconst ORDER = ['P1', 'P2', 'P3'];\nconst highestAllowed = a.severity === 'critical' ? 'P1' : 'P2';\nconst suggested = ORDER.includes(r.priority) ? r.priority : highestAllowed;\nconst priority = ORDER.indexOf(suggested) < ORDER.indexOf(highestAllowed) ? highestAllowed : suggested;\nreturn { json: {\n  alertname: a.alertname,\n  instance: a.instance,\n  severity: a.severity,\n  priority,\n  summary: String(r.summary || a.summary),\n  likely_cause: String(r.likely_cause || ''),\n  first_steps: steps,\n  runbook: a.runbook.split('\\n')[0].replace('# Runbook: ', ''),\n  metric_now: a.metric_now,\n  metric_1h_ago: a.metric_1h_ago,\n  fingerprint: a.fingerprint,\n}};",
+        "mode": "runOnceForEachItem"
+      },
+      "id": "n9",
+      "name": "Ticket fields",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2200,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "table": {
+          "__rl": true,
+          "value": "tickets",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "n10",
+      "name": "Save ticket (Postgres)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2420,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aiOpsPostgres01",
+          "name": "AI Ops Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const t = $json;\nreturn { json: { ticket_id: t.id, report:\n  `[${t.priority}] ${t.summary}\\n` +\n  `Server: ${t.instance}   Alert: ${t.alertname}\\n` +\n  `Metric now: ${t.metric_now}   1 hour ago: ${t.metric_1h_ago}\\n` +\n  `Likely cause: ${t.likely_cause}\\n` +\n  `First steps:\\n${t.first_steps}\\n` +\n  `Runbook: ${t.runbook}   Ticket #${t.id}` } };",
+        "mode": "runOnceForEachItem"
+      },
+      "id": "n11",
+      "name": "Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT (SELECT id FROM tickets WHERE fingerprint = $1 AND status = 'open' ORDER BY id DESC LIMIT 1) AS open_id;",
+        "options": {
+          "queryReplacement": "={{ $json.fingerprint }}"
+        }
+      },
+      "id": "n12",
+      "name": "Find open ticket",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        660,
+        100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aiOpsPostgres01",
+          "name": "AI Ops Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Decides what to do with each alert:\n//   new    = firing, no open ticket yet  -> LLM report and a new ticket\n//   repeat = firing, ticket already open -> only count it, no new ticket\n//   close  = resolved, ticket open       -> close the ticket\nconst out = [];\n$input.all().forEach((item, i) => {\n  const a = $('Prepare').itemMatching(i).json;\n  const openId = item.json.open_id ?? null;\n  let action = null;\n  if (a.status === 'resolved') action = openId ? 'close' : null;\n  else action = openId ? 'repeat' : 'new';\n  if (action) out.push({ json: { ...a, open_id: openId, action }, pairedItem: { item: i } });\n});\nreturn out;"
+      },
+      "id": "n13",
+      "name": "Decide",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "n14c",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "new",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "n14",
+      "name": "New problem?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "n15c",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "close",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "n15",
+      "name": "Resolved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE tickets SET status = 'resolved', resolved_at = now() WHERE id = $1 RETURNING id, alertname, status;",
+        "options": {
+          "queryReplacement": "={{ $json.open_id }}"
+        }
+      },
+      "id": "n16",
+      "name": "Close ticket",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1540,
+        240
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aiOpsPostgres01",
+          "name": "AI Ops Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE tickets SET last_seen = now(), occurrences = occurrences + 1 WHERE id = $1 RETURNING id, alertname, occurrences;",
+        "options": {
+          "queryReplacement": "={{ $json.open_id }}"
+        }
+      },
+      "id": "n17",
+      "name": "Count repeat",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1540,
+        420
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aiOpsPostgres01",
+          "name": "AI Ops Postgres"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Alert from Alertmanager": {
+      "main": [
+        [
+          {
+            "node": "Prepare",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Test alert (manual)": {
+      "main": [
+        [
+          {
+            "node": "Sample alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sample alert": {
+      "main": [
+        [
+          {
+            "node": "Prepare",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare": {
+      "main": [
+        [
+          {
+            "node": "Find open ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Metric now": {
+      "main": [
+        [
+          {
+            "node": "Metric 1 hour ago",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Metric 1 hour ago": {
+      "main": [
+        [
+          {
+            "node": "Build context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build context": {
+      "main": [
+        [
+          {
+            "node": "LLM incident report (Ollama)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM incident report (Ollama)": {
+      "main": [
+        [
+          {
+            "node": "Ticket fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ticket fields": {
+      "main": [
+        [
+          {
+            "node": "Save ticket (Postgres)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save ticket (Postgres)": {
+      "main": [
+        [
+          {
+            "node": "Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find open ticket": {
+      "main": [
+        [
+          {
+            "node": "Decide",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide": {
+      "main": [
+        [
+          {
+            "node": "New problem?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "New problem?": {
+      "main": [
+        [
+          {
+            "node": "Metric now",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Resolved?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolved?": {
+      "main": [
+        [
+          {
+            "node": "Close ticket",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Count repeat",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

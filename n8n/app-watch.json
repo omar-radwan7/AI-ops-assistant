@@ -1,0 +1,1231 @@
+{
+  "id": "aiOpsAppWatch",
+  "name": "AI Ops: app watch",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "w1",
+      "name": "Every minute",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "w2",
+      "name": "Scan now (manual)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "url": "http://127.0.0.1:2375/containers/json",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "all",
+              "value": "true"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "w3",
+      "name": "List containers",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Groups containers by app (Docker Compose project) and finds broken parts of apps that are running.\n// An app that is completely stopped is treated as switched off on purpose: no alarm.\nconst IGNORE_APPS = $('Settings').first().json.ignore_apps || [];   // apps that should never be watched\nconst apps = {};\nfor (const item of $input.all()) {\n  const c = item.json;\n  const app = (c.Labels || {})['com.docker.compose.project'];\n  if (!app || IGNORE_APPS.includes(app)) continue;\n  (apps[app] = apps[app] || []).push(c);\n}\n// How long a running container has been up, from Docker's status text (\"Up 31 seconds\", \"Up About a minute\", ...).\n// Lower bound, so a start time estimated from it is never too early.\nconst upSeconds = status => {\n  const m = /^Up (Less than a second|About an? (minute|hour)|(\\d+) (second|minute|hour|day|week)s?)/.exec(status || '');\n  if (!m) return null;\n  if (m[1] === 'Less than a second') return 0;\n  if (m[2]) return m[2] === 'minute' ? 60 : 3600;\n  return Number(m[3]) * { second: 1, minute: 60, hour: 3600, day: 86400, week: 604800 }[m[4]];\n};\nconst problems = [];\nfor (const [app, containers] of Object.entries(apps)) {\n  const appIsUp = containers.some(c => c.State === 'running' || c.State === 'restarting');\n  if (!appIsUp) continue;\n  for (const c of containers) {\n    const name = c.Names[0].replace(/^\\//, '');\n    let kind = null;\n    if (c.State === 'restarting') kind = 'crash_loop';\n    else if (c.State === 'exited' || c.State === 'dead') kind = 'stopped';\n    if (!kind) continue;\n    problems.push({ json: {\n      app, container: name, id: c.Id, kind, state: c.State, status: c.Status,\n      service: (c.Labels || {})['com.docker.compose.service'] || name,\n      app_containers: containers.map(x => ({ name: x.Names[0].replace(/^\\//, ''), service: (x.Labels || {})['com.docker.compose.service'], state: x.State, status: x.Status, up_seconds: upSeconds(x.Status),\n        depends_on: ((x.Labels || {})['com.docker.compose.depends_on'] || '').split(',').map(s => s.split(':')[0]).filter(Boolean) })),\n    }});\n  }\n}\nreturn problems;"
+      },
+      "id": "w4",
+      "name": "Find problems",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ 'http://127.0.0.1:2375/containers/' + $json.id + '/json' }}",
+        "options": {}
+      },
+      "id": "w5",
+      "name": "Container details",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Turns the Docker details of one broken container into plain facts.\nconst p = $('Find problems').item.json;\nconst d = $json;\nconst st = d.State || {};\nconst TZ = $('Settings').first().json.timezone || 'UTC';\nconst when = t => (t && !t.startsWith('0001')) ? new Date(t).toISOString() : null;\nconst show = t => t ? new Date(t).toLocaleString('de-DE', { timeZone: TZ, day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'unknown time';\nconst facts = {\n  app: p.app,\n  container: p.container,\n  service: p.service,\n  kind: p.kind,\n  state: st.Status,\n  exit_code: st.ExitCode,\n  oom_killed: !!st.OOMKilled,\n  restart_count: d.RestartCount || 0,\n  restart_policy: (d.HostConfig && d.HostConfig.RestartPolicy && d.HostConfig.RestartPolicy.Name) || 'no',\n  last_started: when(st.StartedAt),\n  last_stopped: when(st.FinishedAt),\n  docker_error: st.Error || null,\n  memory_limit_mb: d.HostConfig && d.HostConfig.Memory ? Math.round(d.HostConfig.Memory / 1048576) : null,\n  app_containers: p.app_containers,\n};\n// What Docker itself tells us about how the container ended.\nlet how;\nif (facts.oom_killed) how = 'The system killed it because it ran out of memory (OOMKilled).';\nelse if (facts.kind === 'crash_loop') how = `It crashes right after starting (exit code ${facts.exit_code}) and Docker keeps restarting it: ${facts.restart_count} restarts so far.`;\nelse if (facts.exit_code === 0) how = `It stopped cleanly (exit code 0) at ${show(facts.last_stopped)}. That is a normal shutdown, not a crash.`;\nelse if (facts.exit_code === 137) how = `It was killed (exit code 137) at ${show(facts.last_stopped)}.`;\nelse how = `It stopped with an error (exit code ${facts.exit_code}) at ${show(facts.last_stopped)}.`;\nfacts.how_it_ended = how;\nreturn { json: facts };"
+      },
+      "id": "w6",
+      "name": "Facts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ 'http://127.0.0.1:2375/containers/' + $('Find problems').item.json.id + '/logs' }}",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "stdout",
+              "value": "1"
+            },
+            {
+              "name": "stderr",
+              "value": "1"
+            },
+            {
+              "name": "tail",
+              "value": "200"
+            },
+            {
+              "name": "timestamps",
+              "value": "1"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "id": "w7",
+      "name": "Read logs",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1440,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Reads the last 200 log lines of the broken container and pulls out what matters:\n// the error messages (grouped, with how often and when), the stack trace and the code location.\nconst f = $('Facts').item.json;\nconst raw = typeof $json.data === 'string' ? $json.data : '';\n\n// Docker puts 8 bytes of framing before each line; the timestamp marks where the real text starts.\nconst TS = /(\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d(?:\\.\\d+)?Z) ?(.*)$/;\nconst lines = [];\nfor (const piece of raw.split('\\n')) {\n  const m = piece.match(TS);\n  if (m) lines.push({ t: m[1], text: m[2].replace(/\\x1b\\[[0-9;]*m/g, '').trimEnd() });\n}\n\nconst ERROR = /(error|exception|fatal|panic|traceback|failed|refused|denied|cannot|can't|could not|unhandled|timed? ?out|ECONNREFUSED|EADDRINUSE|ENOENT|EACCES|out of memory|killed|no space left)/i;\nconst STACK = /^\\s*(at .+:\\d+(:\\d+)?\\)?$|File \".+\", line \\d+|\\S+\\.(java|kt|go|rb|py|ts|js|php):\\d+)/;\nconst key = s => s.replace(/0x[0-9a-f]+/gi, '#').replace(/\\d+/g, '#').slice(0, 200);\n\nconst groups = {};\nlines.forEach((l, i) => {\n  if (!ERROR.test(l.text) || STACK.test(l.text)) return;\n  const k = key(l.text);\n  const g = groups[k] || (groups[k] = { message: l.text.slice(0, 300), count: 0, first_seen: l.t, last_seen: l.t, stack: [] });\n  g.count++;\n  g.last_seen = l.t;\n  if (!g.stack.length) {\n    for (let j = i + 1; j < Math.min(i + 20, lines.length); j++) {\n      if (STACK.test(lines[j].text)) g.stack.push(lines[j].text.trim());\n      else if (g.stack.length) break;\n    }\n  }\n});\nconst errors = Object.values(groups).sort((a, b) => b.count - a.count).slice(0, 5);\n\n// The first stack frame that points into the app's own code, not into libraries.\nconst code_location = errors.flatMap(e => e.stack)\n  .find(s => !/node_modules|site-packages|node:internal|internal\\/|<anonymous>/.test(s)) || null;\n\nreturn { json: { ...f, log_lines_read: lines.length, errors, code_location, last_lines: lines.slice(-15).map(l => l.text) } };"
+      },
+      "id": "w8",
+      "name": "Log findings",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Connects the facts of all broken containers into root causes.\n// Every cause comes from evidence Docker or the logs gave us. Nothing here is guessed.\nconst items = $input.all().map(i => i.json);\nconst byApp = {};\nfor (const f of items) (byApp[f.app] = byApp[f.app] || []).push(f);\n\n// Known error messages and what they mean. First match wins.\nconst PATTERNS = [\n  { re: /no space left on device|ENOSPC/i, type: 'disk_full', cause: 'The disk is full, so the app cannot write.', step: 'Free disk space (`df -h`, `docker system df`), then restart the container.' },\n  { re: /EADDRINUSE|address already in use|bind: address/i, type: 'port_in_use', cause: 'The port the app wants is already used by another process.', step: 'Find what holds the port (`ss -ltnp`) and stop it, or change the app port.' },\n  { re: /password authentication failed|access denied for user|authentication failed/i, type: 'bad_credentials', cause: 'The app is using a wrong password or user for a service it connects to.', step: 'Compare the credentials in the app configuration (.env) with the service.' },\n  { re: /(environment variable|env var).*(missing|not set|required|undefined)|missing required (env|config)|is not defined in (the )?env/i, type: 'missing_config', cause: 'A required setting (environment variable) is missing.', step: 'Add the missing variable to the app configuration and restart.' },\n  { re: /permission denied|EACCES/i, type: 'permission', cause: 'The app is not allowed to read or write a file or port it needs.', step: 'Check file owners and permissions of the mounted folders.' },\n  { re: /ENOENT|no such file or directory|cannot find module|module not found|ModuleNotFoundError/i, type: 'missing_file', cause: 'A file or module the app needs does not exist in the container.', step: 'Check the build (was the file copied into the image?) and the paths in the configuration.' },\n];\n\nlet TZ = 'UTC';\ntry { TZ = $('Settings').first().json.timezone || 'UTC'; } catch (e) {}\nconst fmtTime = t => t ? new Date(t).toLocaleString('de-DE', { timeZone: TZ, day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'unknown time';\nconst seen = e => `${e.count} times in the last 200 log lines, last at ${fmtTime(e.last_seen)}`;\nconst incidents = [];\n\nfor (const [app, broken] of Object.entries(byApp)) {\n  const all = broken[0].app_containers;\n  const svc = name => all.find(c => c.service === name || c.name === name);\n  const isDown = c => c && c.state !== 'running';\n  const factsOf = c => broken.find(b => b.container === c.name);\n  const explained = new Set();   // containers whose problem is caused by another container\n  const recovering = new Set();  // containers whose last errors are older than the fix of what they needed\n  const rootOf = {};             // container -> root container\n\n  // Rule 1: a container fails because something it depends on is down.\n  // Evidence: compose depends_on, or the logs name the service (e.g. \"db:5432\").\n  for (const f of broken) {\n    const me = svc(f.service);\n    const named = new Set(me.depends_on);\n    const text = f.errors.map(e => e.message).join('\\n');\n    for (const c of all) if (c.service && c.service !== f.service && new RegExp(`\\\\b${c.service}(:\\\\d+)?\\\\b`).test(text)) named.add(c.service);\n    const dep = [...named].map(svc).find(isDown);\n    if (dep) { explained.add(f.container); rootOf[f.container] = dep.name; continue; }\n    // Recovering: the part it complains about is running again, and every error is older than that restart.\n    // The container is only waiting for Docker's next restart, so this is not a new problem.\n    const backAt = [...named].map(svc).filter(c => c && c.state === 'running' && c.up_seconds != null).map(c => Date.now() - c.up_seconds * 1000);\n    const lastErr = f.errors.map(e => Date.parse(e.last_seen)).sort().pop();\n    if (f.kind === 'crash_loop' && backAt.length && lastErr && lastErr < Math.min(...backAt)) recovering.add(f.container);\n  }\n  // Follow chains: frontend -> backend -> db gives root db.\n  const root = n => rootOf[n] ? root(rootOf[n]) : n;\n\n  const roots = [...new Set(broken.filter(f => !recovering.has(f.container)).map(f => root(f.container)))];\n  for (const r of roots) {\n    const f = factsOf({ name: r });\n    const victims = broken.filter(b => b.container !== r && root(b.container) === r);\n    // Running containers that depend (directly or through others) on a broken one are affected too.\n    const down = new Set([r, ...victims.map(v => v.container)]);\n    let grew = true;\n    while (grew) { grew = false; for (const c of all) if (!down.has(c.name) && c.depends_on.some(s => down.has(svc(s) && svc(s).name))) { down.add(c.name); grew = true; } }\n    const affected = [...down].filter(n => n !== r);\n\n    const inc = { app, root_container: r, service: f ? f.service : r, affected, evidence: [], next_steps: [], cause_type: null, cause: null, code_location: null, needs_investigation: false, fingerprint: null };\n    const ev = s => inc.evidence.push(s);\n    for (const v of victims) {\n      const top = v.errors[0];\n      ev(`${v.container}: ${v.how_it_ended}`);\n      if (top) ev(`${v.container} log: \"${top.message.slice(0, 160)}\" (${seen(top)})`);\n    }\n    if (f) ev(`${r}: ${f.how_it_ended}`);\n    const top = f && f.errors[0];\n    const pattern = f && PATTERNS.find(p => f.errors.some(e => p.re.test(e.message)));\n\n    if (f && f.oom_killed) {\n      inc.cause_type = 'out_of_memory';\n      inc.cause = `${r} was killed by the system because it ran out of memory${f.memory_limit_mb ? ` (limit ${f.memory_limit_mb} MB)` : ''}.`;\n      inc.next_steps.push('Check the memory use of the app (`docker stats`) for a leak, then raise the memory limit if the use is normal.');\n    } else if (pattern) {\n      const e = f.errors.find(e => pattern.re.test(e.message));\n      ev(`${r} log: \"${e.message.slice(0, 160)}\" (${seen(e)})`);\n      inc.cause_type = pattern.type; inc.cause = `${r}: ${pattern.cause}`; inc.next_steps.push(pattern.step);\n    } else if (f && f.code_location && top) {\n      inc.cause_type = 'code_error'; inc.code_location = f.code_location;\n      inc.cause = `A bug in the app code: \"${top.message.slice(0, 160)}\" at ${f.code_location.replace(/^at /, '')}.`;\n      ev(`${r} log: \"${top.message.slice(0, 160)}\" (${seen(top)})`); ev(`Stack trace points to ${f.code_location}`);\n      inc.next_steps.push(`Open ${f.code_location.replace(/^at /, '')} and fix the error; the full stack trace is in the container logs.`);\n    } else if (f && f.kind === 'stopped' && f.exit_code === 0) {\n      inc.cause_type = 'stopped_by_command';\n      const manual = f.restart_policy === 'unless-stopped' || f.restart_policy === 'always';\n      inc.cause = `${r} is not running. It did not crash: it shut down cleanly (exit code 0) at ${fmtTime(f.last_stopped)}` +\n        (manual ? `, which happens after a stop command (\\`docker stop\\` or \\`docker compose stop\\`). Docker never restarts a container that was stopped this way.` : '.');\n      // Only a shutdown line from the minutes before the stop counts as evidence for this stop.\n      const stopAt = Date.parse(f.last_stopped);\n      const shutdownLine = f.errors.find(e => /administrator command|shutting down|received (SIGTERM|signal)|graceful/i.test(e.message)\n        && Math.abs(stopAt - Date.parse(e.last_seen)) < 10 * 60 * 1000);\n      if (shutdownLine) ev(`${r} log: \"${shutdownLine.message.slice(0, 160)}\"`);\n      inc.next_steps.push(`Start it again: \\`docker compose -p ${app} start ${inc.service}\\``);\n      inc.next_steps.push(`Find out who stopped it on ${fmtTime(f.last_stopped).slice(0, 10)} so it does not happen again.`);\n    } else if (f && top) {\n      inc.cause_type = 'app_error';\n      inc.cause = `${r} ${f.kind === 'crash_loop' ? 'crashes on start' : 'stopped'} with this error: \"${top.message.slice(0, 200)}\".`;\n      ev(`${r} log: \"${top.message.slice(0, 160)}\" (${seen(top)})`);\n      inc.next_steps.push(`Read the full log around ${fmtTime(top.last_seen)}: \\`docker logs --since 10m ${r}\\``);\n      inc.needs_investigation = true;   // the message is known, but not why it happens\n    } else {\n      inc.cause_type = 'unknown';\n      inc.cause = `${r} ${f ? f.how_it_ended : 'is down'} The logs contain no error message.`;\n      inc.needs_investigation = true;\n    }\n    // Since when: the stop time of a stopped root, or the first error we still have in the logs.\n    const firstErr = [f, ...victims].filter(Boolean).flatMap(x => x.errors).map(e => e.first_seen).sort()[0];\n    if (f && f.kind === 'stopped' && f.last_stopped) { inc.down_since = f.last_stopped; inc.down_since_exact = true; }\n    else { inc.down_since = firstErr || null; inc.down_since_exact = false; }\n    inc.affected_detail = affected.map(n => {\n      const v = victims.find(x => x.container === n);\n      if (v) return `${n}: ${v.kind === 'crash_loop' ? 'crash loop' : 'stopped'}, because it needs ${r}`;\n      const c = all.find(x => x.name === n);\n      const dep = c.depends_on.map(svc).find(x => x && down.has(x.name));\n      return `${n}: still running, but it depends on ${dep ? dep.name : r}, which is down, so its users get errors`;\n    });\n    inc.victim_services = victims.map(v => v.service);\n    if (victims.length) inc.next_steps.push(`After that, ${victims.map(v => v.container).join(', ')} should recover by itself; check it with \\`docker ps\\`.`);\n    inc.title = `${app}: ${inc.cause_type === 'stopped_by_command' ? `${inc.service} is stopped` : inc.cause_type.replace(/_/g, ' ')}` + (affected.length ? `, ${affected.length} other part(s) affected` : '');\n    // Same root, same kind of cause = same incident, so repeats are counted instead of new tickets.\n    inc.fingerprint = `${app}|${r}|${inc.cause_type}`;\n    incidents.push({ json: inc });\n  }\n}\nreturn incidents;"
+      },
+      "id": "w9",
+      "name": "Find cause",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.needs_investigation && $('Settings').first().json.ai_investigation !== 'off' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "w10",
+      "name": "Needs investigation?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3900,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// The question for the AI: what we already know, and what is still open.\nconst i = $json;\nconst text = [\n  `App: ${i.app}`,\n  `Broken container: ${i.root_container}`,\n  `What the rules found: ${i.cause}`,\n  `Facts so far:`, ...i.evidence.map(e => `- ${e}`),\n  i.affected.length ? `Other parts affected: ${i.affected.join(', ')}` : '',\n  '',\n  'Find the root cause. The error above may only be a symptom. Check the other containers of this app, their logs and states, and the server metrics.',\n].filter(Boolean).join('\\n');\nreturn { json: { ...i, question: text } };"
+      },
+      "id": "w11",
+      "name": "Investigation brief",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4140,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.question }}",
+        "options": {
+          "systemMessage": "You investigate why an application broke on a server. You can only read, never change anything.\nWork in this order:\n1. Call list_app_containers to see every part of the app.\n2. For every container that is not running, call read_container_logs and container_state.\n3. If a log points to another part, a file, the disk or memory, check that too (query_metrics, check_endpoint).\nNever state a fact you did not see in a tool result. Never mention a container that list_app_containers did not show.\nOnly when you are done, reply with this JSON and nothing else:\n{\"cause\": \"one or two sentences: what broke first and why the rest broke\",\n \"root_container\": \"the container where the problem starts\",\n \"evidence\": [\"text copied exactly from a tool result\", \"...\"],\n \"checked\": [\"what you checked\"],\n \"next_steps\": [\"up to 3 concrete steps for the developer\"]}",
+          "maxIterations": 6,
+          "returnIntermediateSteps": true,
+          "forceToolCallOnFirstIteration": true
+        }
+      },
+      "id": "w12",
+      "name": "AI investigation",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        4380,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "model": "qwen3:8b",
+        "options": {
+          "temperature": 0.1,
+          "numCtx": 8192,
+          "think": false,
+          "keepAlive": "0"
+        }
+      },
+      "credentials": {
+        "ollamaApi": {
+          "id": "aiOpsOllama01",
+          "name": "Local Ollama"
+        }
+      },
+      "id": "w13",
+      "name": "Local model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+      "typeVersion": 1,
+      "position": [
+        4120,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Keeps only evidence the AI really saw. Every quote must appear in a tool result.\nconst inc = $('Investigation brief').item.json;\nconst steps = $json.intermediateSteps || [];\nconst seen = steps.map(s => String(s.observation || '')).join('\\n').toLowerCase();\nconst norm = s => String(s).toLowerCase().replace(/\\s+/g, ' ').trim();\nlet ans = {};\ntry { ans = JSON.parse(String($json.output).replace(/<think>[\\s\\S]*?<\\/think>/g, '').match(/\\{[\\s\\S]*\\}/)[0]); } catch (e) { ans = {}; }\nconst quotes = (ans.evidence || []).map(String);\nconst verified = quotes.filter(q => q.length > 5 && seen.replace(/\\s+/g, ' ').includes(norm(q).replace(/^\"|\"$/g, '')));\nconst rejected = quotes.filter(q => !verified.includes(q));\nconst tools_used = steps.map(s => `${s.action && s.action.tool}(${JSON.stringify((s.action && s.action.toolInput) || {})})`);\nconst out = { ...inc, investigation: { tools_used, checked: ans.checked || [], rejected_evidence: rejected } };\ndelete out.question;\nif (ans.cause && verified.length) {\n  out.cause_type = 'found_by_investigation';\n  out.cause = ans.cause;\n  if (ans.root_container) out.investigation_root = ans.root_container;\n  out.evidence = [...inc.evidence, ...verified.map(q => `found by investigation: \"${q.slice(0, 200)}\"`)];\n  out.next_steps = (ans.next_steps || []).slice(0, 3);\n  out.needs_investigation = false;\n} else {\n  out.cause = `${inc.cause} The investigation could not back up a deeper cause with evidence.`;\n  out.next_steps = [...inc.next_steps, ...(ans.checked && ans.checked.length ? [`Already checked: ${ans.checked.join('; ')}`] : [])];\n}\nreturn { json: out };"
+      },
+      "id": "w14",
+      "name": "Check evidence",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4740,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "toolDescription": "Lists every container of the broken app with its state and status. Use it first to see which parts are down.",
+        "url": "http://127.0.0.1:2375/containers/json",
+        "options": {},
+        "optimizeResponse": true,
+        "responseType": "json",
+        "truncateResponse": true,
+        "maxLength": 1200,
+        "fieldsToInclude": "selected",
+        "fields": "Names,State,Status",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "all",
+              "value": "true"
+            },
+            {
+              "name": "filters",
+              "value": "={{ JSON.stringify({label: ['com.docker.compose.project=' + $('Investigation brief').item.json.app]}) }}"
+            }
+          ]
+        }
+      },
+      "id": "t1",
+      "name": "list_app_containers",
+      "type": "n8n-nodes-base.httpRequestTool",
+      "typeVersion": 4.2,
+      "position": [
+        4260,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "toolDescription": "Reads the last 60 log lines of one container. Input: the container name exactly as listed.",
+        "url": "=http://127.0.0.1:2375/containers/{{ $fromAI('container', 'container name exactly as listed', 'string') }}/logs",
+        "options": {},
+        "optimizeResponse": true,
+        "responseType": "text",
+        "truncateResponse": true,
+        "maxLength": 1500,
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "stdout",
+              "value": "1"
+            },
+            {
+              "name": "stderr",
+              "value": "1"
+            },
+            {
+              "name": "timestamps",
+              "value": "0"
+            },
+            {
+              "name": "tail",
+              "value": "60"
+            }
+          ]
+        }
+      },
+      "id": "t2",
+      "name": "read_container_logs",
+      "type": "n8n-nodes-base.httpRequestTool",
+      "typeVersion": 4.2,
+      "position": [
+        4390,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "toolDescription": "Shows how a container ended: state, exit code, OOMKilled, start and stop time, restart count.",
+        "url": "=http://127.0.0.1:2375/containers/{{ $fromAI('container', 'container name exactly as listed', 'string') }}/json",
+        "options": {},
+        "optimizeResponse": true,
+        "responseType": "json",
+        "truncateResponse": true,
+        "maxLength": 1200,
+        "fieldsToInclude": "selected",
+        "fields": "State,RestartCount"
+      },
+      "id": "t3",
+      "name": "container_state",
+      "type": "n8n-nodes-base.httpRequestTool",
+      "typeVersion": 4.2,
+      "position": [
+        4520,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "toolDescription": "Runs a PromQL query on Prometheus for the server metrics, e.g. node_filesystem_avail_bytes, node_memory_MemAvailable_bytes, up.",
+        "url": "http://127.0.0.1:9090/api/v1/query",
+        "options": {},
+        "optimizeResponse": true,
+        "responseType": "json",
+        "truncateResponse": true,
+        "maxLength": 1200,
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "query",
+              "value": "={{ $fromAI('promql', 'a PromQL query', 'string') }}"
+            }
+          ]
+        }
+      },
+      "id": "t4",
+      "name": "query_metrics",
+      "type": "n8n-nodes-base.httpRequestTool",
+      "typeVersion": 4.2,
+      "position": [
+        4650,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "toolDescription": "Calls an HTTP endpoint of the app on this server with GET, e.g. port 3000 path /health. Shows what users would get.",
+        "url": "=http://127.0.0.1:{{ $fromAI('port', 'port number', 'number') }}{{ $fromAI('path', 'path starting with /', 'string') }}",
+        "options": {},
+        "optimizeResponse": true,
+        "responseType": "text",
+        "truncateResponse": true,
+        "maxLength": 800
+      },
+      "id": "t5",
+      "name": "check_endpoint",
+      "type": "n8n-nodes-base.httpRequestTool",
+      "typeVersion": 4.2,
+      "position": [
+        4780,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Settings for this installation. install.sh replaces this block with the values from .env.\nreturn [{ json: {\n  email_from: 'you@example.com',\n  email_to: 'you@example.com',\n  ai_investigation: 'off',\n  timezone: 'Europe/Berlin',\n  app_labels: {},\n  ignore_apps: ['ai-ops-assistant'],\n} }];"
+      },
+      "id": "s0",
+      "name": "Settings",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  (SELECT id FROM incidents WHERE fingerprint = $1 AND status = 'open' ORDER BY id DESC LIMIT 1) AS open_id,\n  (SELECT emailed_at IS NOT NULL FROM incidents WHERE fingerprint = $1 AND status = 'open' ORDER BY id DESC LIMIT 1) AS emailed;",
+        "options": {
+          "queryReplacement": "={{ [$json.fingerprint] }}"
+        }
+      },
+      "id": "p1",
+      "name": "Find open incident",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2160,
+        100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aiOpsPostgres01",
+          "name": "AI Ops Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// New problem: save it and email it. Known problem whose email went out: only count it.\n// Known problem whose email failed last time: try the email again.\nreturn $input.all().map((it, i) => {\n  const inc = $('Find cause').itemMatching(i).json;\n  const open_id = it.json.open_id || null;\n  const action = !open_id ? 'new' : (it.json.emailed ? 'repeat' : 'notify');\n  return { json: { ...inc, open_id, action }, pairedItem: { item: i } };\n});"
+      },
+      "id": "p2",
+      "name": "Decide",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2400,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "c2",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "repeat",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "p3",
+      "name": "Needs email?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2640,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH input AS (SELECT $1::jsonb AS j),\ncreated AS (\n  INSERT INTO incidents (fingerprint, app, root_container, cause_type, title, cause, evidence, affected, next_steps)\n  SELECT j->>'fingerprint', j->>'app', j->>'root_container', j->>'cause_type', j->>'title', j->>'cause', j->'evidence', j->'affected', j->'next_steps'\n  FROM input WHERE j->>'action' = 'new' RETURNING id)\nSELECT id FROM created\nUNION ALL SELECT (j->>'open_id')::int FROM input WHERE j->>'action' = 'notify';",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($json)] }}"
+        }
+      },
+      "id": "p4",
+      "name": "Save incident",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2880,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aiOpsPostgres01",
+          "name": "AI Ops Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE incidents SET last_seen = now(), occurrences = occurrences + 1 WHERE id = $1 RETURNING id, occurrences;",
+        "options": {
+          "queryReplacement": "={{ [$json.open_id] }}"
+        }
+      },
+      "id": "p5",
+      "name": "Count repeat",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2880,
+        260
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aiOpsPostgres01",
+          "name": "AI Ops Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const esc = s => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n// Text between backticks is a command: shown as code so it can be copied.\nconst fmt = s => esc(s).replace(/`([^`]+)`/g, '<code style=\"background:#f2f2f2;padding:1px 4px;border-radius:3px\">$1</code>');\nconst list = (xs, ordered) => xs && xs.length ? `<${ordered ? 'ol' : 'ul'}>${xs.map(x => `<li style=\"margin:3px 0\">${fmt(x)}</li>`).join('')}</${ordered ? 'ol' : 'ul'}>` : '<p>none</p>';\nconst S = $('Settings').first().json;\nconst TZ = S.timezone || 'UTC';\nconst local = t => new Date(t).toLocaleString('de-DE', { timeZone: TZ, day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });\nconst label = app => (S.app_labels || {})[app] || app;\nconst duration = ms => { const m = Math.max(1, Math.round(ms / 60000)); if (m < 60) return `${m} minute${m > 1 ? 's' : ''}`;\n  const h = Math.floor(m / 60); if (h < 48) return `${h} hour${h > 1 ? 's' : ''}`; const dd = Math.floor(h / 24); return `${dd} days`; };\nconst tlist = (xs, ordered) => (xs || []).map((x, k) => `  ${ordered ? (k + 1) + '.' : '-'} ${x}`).join('\\n') || '  none';\nconst section = (h, body) => `<h3 style=\"margin:18px 0 6px;font-size:15px\">${h}</h3>${body}`;\nconst page = (title, color, inner) => `<div style=\"font-family:Arial,sans-serif;max-width:720px;color:#222\"><div style=\"border-left:5px solid ${color};padding:4px 12px;margin-bottom:8px\"><h2 style=\"margin:0;font-size:18px\">${esc(title)}</h2></div>${inner}<p style=\"color:#888;font-size:12px;margin-top:24px\">Sent by ai-ops-assistant. It only reads containers, logs and metrics; it changed nothing on the server.</p></div>`;\n\n// The first email for a new incident: cause, evidence and next steps from the rules.\nconst inc = $('Decide').item.json;\nconst id = $json.id;\nconst waiting = inc.needs_investigation && $('Settings').first().json.ai_investigation !== 'off';\n// Subject: what is broken, for how long, and what it breaks.\nconst svcName = inc.service;\nconst headline = inc.cause_type === 'stopped_by_command' ? `${svcName} stopped` : `${svcName}: ${(inc.cause_type || 'problem').replace(/_/g, ' ')}`;\nconst since = inc.down_since ? duration(Date.now() - Date.parse(inc.down_since)) : null;\nconst victims = (inc.victim_services || []);\nconst subject = `[ai-ops] #${id} ${label(inc.app)}: ${headline}${since ? (inc.down_since_exact ? ` for ${since}` : ` (at least ${since})`) : ''}${victims.length ? `, ${victims.join(' and ')} crashing` : ''}`;\nconst sinceLine = inc.down_since ? `${inc.down_since_exact ? 'Down' : 'Failing'} for ${inc.down_since_exact ? '' : 'at least '}${since}, since ${local(inc.down_since)}.` : '';\nconst html = page(subject, '#c0392b',\n  (sinceLine ? `<p style=\"font-size:15px;margin:6px 0 0\"><b>${esc(sinceLine)}</b></p>` : '') +\n  section('Cause', `<p>${fmt(inc.cause)}</p>`) +\n  (inc.code_location ? section('Where in the code', `<p><code>${esc(inc.code_location)}</code></p>`) : '') +\n  section('Affected', (inc.affected_detail || inc.affected).length ? list(inc.affected_detail || inc.affected) : '<p>only this container</p>') +\n  section('Evidence', list(inc.evidence)) +\n  section('Next steps', list(inc.next_steps, true)) +\n  (waiting ? section('Investigation', '<p>The rules found the error but not why it happens. An AI investigation is running now; its result follows in a second email.</p>') : ''));\nconst text = [subject, '', sinceLine, '', 'Cause:', '  ' + inc.cause, inc.code_location ? `Where in the code:\\n  ${inc.code_location}` : '',\n  'Affected:', tlist((inc.affected_detail || inc.affected).length ? (inc.affected_detail || inc.affected) : ['only this container']), 'Evidence:', tlist(inc.evidence), 'Next steps:', tlist(inc.next_steps, true),\n  waiting ? '\\nAn AI investigation is running now; its result follows in a second email.' : ''].filter(Boolean).join('\\n');\nreturn { json: { ...inc, incident_id: id, subject, html, text } };",
+        "mode": "runOnceForEachItem"
+      },
+      "id": "p6",
+      "name": "Build email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $('Settings').first().json.email_from }}",
+        "toEmail": "={{ $('Settings').first().json.email_to }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "both",
+        "text": "={{ $json.text }}",
+        "html": "={{ $json.html }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "p7",
+      "name": "Email: new incident",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        3360,
+        -120
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "aiOpsSmtp01",
+          "name": "Gmail SMTP"
+        }
+      },
+      "webhookId": "p7"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE incidents SET investigation = j->'investigation',\n  cause = CASE WHEN j->>'cause_type' = 'found_by_investigation' THEN j->>'cause' ELSE cause END,\n  evidence = j->'evidence', next_steps = j->'next_steps'\nFROM (SELECT $1::jsonb AS j) s WHERE id = (j->>'incident_id')::int RETURNING id;",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($json)] }}"
+        }
+      },
+      "id": "p8",
+      "name": "Save investigation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        4980,
+        100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aiOpsPostgres01",
+          "name": "AI Ops Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const esc = s => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n// Text between backticks is a command: shown as code so it can be copied.\nconst fmt = s => esc(s).replace(/`([^`]+)`/g, '<code style=\"background:#f2f2f2;padding:1px 4px;border-radius:3px\">$1</code>');\nconst list = (xs, ordered) => xs && xs.length ? `<${ordered ? 'ol' : 'ul'}>${xs.map(x => `<li style=\"margin:3px 0\">${fmt(x)}</li>`).join('')}</${ordered ? 'ol' : 'ul'}>` : '<p>none</p>';\nconst S = $('Settings').first().json;\nconst TZ = S.timezone || 'UTC';\nconst local = t => new Date(t).toLocaleString('de-DE', { timeZone: TZ, day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });\nconst label = app => (S.app_labels || {})[app] || app;\nconst duration = ms => { const m = Math.max(1, Math.round(ms / 60000)); if (m < 60) return `${m} minute${m > 1 ? 's' : ''}`;\n  const h = Math.floor(m / 60); if (h < 48) return `${h} hour${h > 1 ? 's' : ''}`; const dd = Math.floor(h / 24); return `${dd} days`; };\nconst tlist = (xs, ordered) => (xs || []).map((x, k) => `  ${ordered ? (k + 1) + '.' : '-'} ${x}`).join('\\n') || '  none';\nconst section = (h, body) => `<h3 style=\"margin:18px 0 6px;font-size:15px\">${h}</h3>${body}`;\nconst page = (title, color, inner) => `<div style=\"font-family:Arial,sans-serif;max-width:720px;color:#222\"><div style=\"border-left:5px solid ${color};padding:4px 12px;margin-bottom:8px\"><h2 style=\"margin:0;font-size:18px\">${esc(title)}</h2></div>${inner}<p style=\"color:#888;font-size:12px;margin-top:24px\">Sent by ai-ops-assistant. It only reads containers, logs and metrics; it changed nothing on the server.</p></div>`;\n\n// The second email: what the AI investigation found, with only the evidence it really saw.\nconst inc = $('Check evidence').item.json;\nconst inv = inc.investigation || {};\nconst found = inc.cause_type === 'found_by_investigation';\nconst subject = `[ai-ops] #${inc.incident_id} investigation: ${found ? 'root cause found' : 'no deeper cause found'}`;\nconst html = page(subject, found ? '#2c7be5' : '#888',\n  section(found ? 'Root cause' : 'Result', `<p>${fmt(inc.cause)}</p>`) +\n  (found ? section('Starts in', `<p><code>${esc(inc.investigation_root || inc.root_container)}</code></p>`) : '') +\n  section('Evidence', list(inc.evidence)) +\n  section('Next steps', list(inc.next_steps, true)) +\n  section('How it was investigated', list(inv.tools_used && inv.tools_used.length ? inv.tools_used : ['the AI did not call any tool'])) +\n  (inv.rejected_evidence && inv.rejected_evidence.length ? section('Thrown out', `<p>The AI claimed these, but they were not in any tool result, so they are not used:</p>${list(inv.rejected_evidence)}`) : ''));\nconst text = [subject, '', (found ? 'Root cause:' : 'Result:'), '  ' + inc.cause, 'Evidence:', tlist(inc.evidence), 'Next steps:', tlist(inc.next_steps, true),\n  'How it was investigated:', tlist(inv.tools_used), inv.rejected_evidence && inv.rejected_evidence.length ? 'Thrown out (not in any tool result):\\n' + tlist(inv.rejected_evidence) : ''].filter(Boolean).join('\\n');\nreturn { json: { ...inc, subject, html, text } };",
+        "mode": "runOnceForEachItem"
+      },
+      "id": "p9",
+      "name": "Build investigation email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5220,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $('Settings').first().json.email_from }}",
+        "toEmail": "={{ $('Settings').first().json.email_to }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "both",
+        "text": "={{ $json.text }}",
+        "html": "={{ $json.html }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "p10",
+      "name": "Email: investigation result",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        5460,
+        100
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "aiOpsSmtp01",
+          "name": "Gmail SMTP"
+        }
+      },
+      "webhookId": "p10"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM incidents WHERE status = 'open';",
+        "options": {
+          "queryReplacement": "={{ [] }}"
+        }
+      },
+      "id": "r1",
+      "name": "Open incidents",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        720,
+        -320
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aiOpsPostgres01",
+          "name": "AI Ops Postgres"
+        }
+      },
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Closes open incidents whose containers are healthy again, or whose app was switched off.\nconst containers = $('List containers').all().map(i => i.json);\nconst nameOf = c => c.Names[0].replace(/^\\//, '');\nconst state = n => { const c = containers.find(c => nameOf(c) === n); return c ? c.State : 'gone'; };\nconst out = [];\nfor (const it of $input.all()) {\n  const r = it.json;\n  if (!r.id) continue;\n  const appParts = containers.filter(c => (c.Labels || {})['com.docker.compose.project'] === r.app);\n  const appOff = !appParts.some(c => c.State === 'running' || c.State === 'restarting');\n  const parts = [r.root_container, ...(r.affected || [])];\n  const healthy = state(r.root_container) === 'running' && parts.every(n => ['running', 'gone'].includes(state(n)));\n  if (appOff) out.push({ json: { ...r, resolved_note: 'The whole app was switched off, so this incident is closed.' } });\n  else if (healthy) out.push({ json: { ...r, resolved_note: `${r.root_container} is running again and every affected part is up.` } });\n}\nreturn out;"
+      },
+      "id": "r2",
+      "name": "Check recovered",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        -320
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE incidents SET status = 'resolved', resolved_at = now(), resolved_note = $2 WHERE id = $1 RETURNING *;",
+        "options": {
+          "queryReplacement": "={{ [$json.id, $json.resolved_note] }}"
+        }
+      },
+      "id": "r3",
+      "name": "Mark resolved",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1200,
+        -320
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aiOpsPostgres01",
+          "name": "AI Ops Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const esc = s => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n// Text between backticks is a command: shown as code so it can be copied.\nconst fmt = s => esc(s).replace(/`([^`]+)`/g, '<code style=\"background:#f2f2f2;padding:1px 4px;border-radius:3px\">$1</code>');\nconst list = (xs, ordered) => xs && xs.length ? `<${ordered ? 'ol' : 'ul'}>${xs.map(x => `<li style=\"margin:3px 0\">${fmt(x)}</li>`).join('')}</${ordered ? 'ol' : 'ul'}>` : '<p>none</p>';\nconst S = $('Settings').first().json;\nconst TZ = S.timezone || 'UTC';\nconst local = t => new Date(t).toLocaleString('de-DE', { timeZone: TZ, day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });\nconst label = app => (S.app_labels || {})[app] || app;\nconst duration = ms => { const m = Math.max(1, Math.round(ms / 60000)); if (m < 60) return `${m} minute${m > 1 ? 's' : ''}`;\n  const h = Math.floor(m / 60); if (h < 48) return `${h} hour${h > 1 ? 's' : ''}`; const dd = Math.floor(h / 24); return `${dd} days`; };\nconst tlist = (xs, ordered) => (xs || []).map((x, k) => `  ${ordered ? (k + 1) + '.' : '-'} ${x}`).join('\\n') || '  none';\nconst section = (h, body) => `<h3 style=\"margin:18px 0 6px;font-size:15px\">${h}</h3>${body}`;\nconst page = (title, color, inner) => `<div style=\"font-family:Arial,sans-serif;max-width:720px;color:#222\"><div style=\"border-left:5px solid ${color};padding:4px 12px;margin-bottom:8px\"><h2 style=\"margin:0;font-size:18px\">${esc(title)}</h2></div>${inner}<p style=\"color:#888;font-size:12px;margin-top:24px\">Sent by ai-ops-assistant. It only reads containers, logs and metrics; it changed nothing on the server.</p></div>`;\n\n// Short email when an incident is over.\nconst r = $json;\nconst mins = Math.max(1, Math.round((Date.parse(r.resolved_at) - Date.parse(r.first_seen)) / 60000));\nconst subject = `[ai-ops] resolved #${r.id} ${r.title}`;\nconst html = page(subject, '#27ae60', `<p>${esc(r.resolved_note)}</p><p>Open for ${mins} minute(s), seen in ${r.occurrences} scan(s).</p>` + section('Cause was', `<p>${esc(r.cause)}</p>`));\nconst text = `${subject}\\n\\n${r.resolved_note}\\nOpen for ${mins} minute(s), seen in ${r.occurrences} scan(s).\\n\\nCause was:\\n  ${r.cause}`;\nreturn { json: { ...r, subject, html, text } };",
+        "mode": "runOnceForEachItem"
+      },
+      "id": "r4",
+      "name": "Build resolved email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        -320
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $('Settings').first().json.email_from }}",
+        "toEmail": "={{ $('Settings').first().json.email_to }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "both",
+        "text": "={{ $json.text }}",
+        "html": "={{ $json.html }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "r5",
+      "name": "Email: resolved",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1680,
+        -320
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "aiOpsSmtp01",
+          "name": "Gmail SMTP"
+        }
+      },
+      "webhookId": "r5"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE incidents SET emailed_at = now() WHERE id = $1 RETURNING id;",
+        "options": {
+          "queryReplacement": "={{ [$('Build email').item.json.incident_id] }}"
+        }
+      },
+      "id": "p11",
+      "name": "Mark emailed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3600,
+        -120
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "aiOpsPostgres01",
+          "name": "AI Ops Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## 1. Scan\nEvery minute: list all containers through the read-only Docker proxy and keep the broken parts of apps that are running.",
+        "height": 460,
+        "width": 920,
+        "color": 5
+      },
+      "id": "note1",
+      "name": "Note 1",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -50,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 2. Find the cause\nRead how each container ended and its last 200 log lines, then follow the app's dependencies to one root cause.",
+        "height": 260,
+        "width": 1160,
+        "color": 4
+      },
+      "id": "note2",
+      "name": "Note 2",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        910,
+        -20
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 3. Report once\nNew incident: save it, email the developer, mark it as emailed. Known incident: only count it.",
+        "height": 640,
+        "width": 1640,
+        "color": 6
+      },
+      "id": "note3",
+      "name": "Note 3",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2110,
+        -240
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 4. Close fixed incidents\nHealthy again, or the whole app switched off: close the incident and send a short email.",
+        "height": 260,
+        "width": 1160,
+        "color": 7
+      },
+      "id": "note4",
+      "name": "Note 4",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        670,
+        -440
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Optional: AI investigation\nOnly when the rules cannot explain an error. A local model reads logs and states through read-only tools. Quotes it did not really see are thrown out.",
+        "height": 500,
+        "width": 1760,
+        "color": 1
+      },
+      "id": "note5",
+      "name": "Note 5",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        3850,
+        -20
+      ]
+    }
+  ],
+  "connections": {
+    "Every minute": {
+      "main": [
+        [
+          {
+            "node": "Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Scan now (manual)": {
+      "main": [
+        [
+          {
+            "node": "Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "List containers": {
+      "main": [
+        [
+          {
+            "node": "Find problems",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Open incidents",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find problems": {
+      "main": [
+        [
+          {
+            "node": "Container details",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Container details": {
+      "main": [
+        [
+          {
+            "node": "Facts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Facts": {
+      "main": [
+        [
+          {
+            "node": "Read logs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read logs": {
+      "main": [
+        [
+          {
+            "node": "Log findings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log findings": {
+      "main": [
+        [
+          {
+            "node": "Find cause",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find cause": {
+      "main": [
+        [
+          {
+            "node": "Find open incident",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs investigation?": {
+      "main": [
+        [
+          {
+            "node": "Investigation brief",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Investigation brief": {
+      "main": [
+        [
+          {
+            "node": "AI investigation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI investigation": {
+      "main": [
+        [
+          {
+            "node": "Check evidence",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check evidence": {
+      "main": [
+        [
+          {
+            "node": "Save investigation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "list_app_containers": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI investigation",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "read_container_logs": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI investigation",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "container_state": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI investigation",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "query_metrics": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI investigation",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "check_endpoint": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI investigation",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Settings": {
+      "main": [
+        [
+          {
+            "node": "List containers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find open incident": {
+      "main": [
+        [
+          {
+            "node": "Decide",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide": {
+      "main": [
+        [
+          {
+            "node": "Needs email?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save incident": {
+      "main": [
+        [
+          {
+            "node": "Build email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build email": {
+      "main": [
+        [
+          {
+            "node": "Email: new incident",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Needs investigation?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save investigation": {
+      "main": [
+        [
+          {
+            "node": "Build investigation email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build investigation email": {
+      "main": [
+        [
+          {
+            "node": "Email: investigation result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Open incidents": {
+      "main": [
+        [
+          {
+            "node": "Check recovered",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check recovered": {
+      "main": [
+        [
+          {
+            "node": "Mark resolved",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark resolved": {
+      "main": [
+        [
+          {
+            "node": "Build resolved email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build resolved email": {
+      "main": [
+        [
+          {
+            "node": "Email: resolved",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs email?": {
+      "main": [
+        [
+          {
+            "node": "Save incident",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Count repeat",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email: new incident": {
+      "main": [
+        [
+          {
+            "node": "Mark emailed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Local model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI investigation",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

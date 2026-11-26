@@ -1,0 +1,19 @@
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://127.0.0.1:9090
+    isDefault: true
+
+  - name: Tickets
+    uid: tickets
+    type: grafana-postgresql-datasource
+    url: 127.0.0.1:5433
+    user: ops
+    jsonData:
+      database: ops
+      sslmode: disable
+    secureJsonData:
+      password: $POSTGRES_PASSWORD

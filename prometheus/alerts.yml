@@ -1,0 +1,38 @@
+groups:
+  - name: server
+    rules:
+      - alert: HighCPU
+        expr: 100 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[1m])) * 100 > 85
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CPU usage above 85% on {{ $labels.instance }}"
+          description: "CPU usage has been {{ $value | printf \"%.0f\" }}% for more than 1 minute."
+
+      - alert: HighMemory
+        expr: (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 > 90
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Memory usage above 90% on {{ $labels.instance }}"
+          description: "Memory usage is {{ $value | printf \"%.0f\" }}%."
+
+      - alert: DiskAlmostFull
+        expr: (1 - node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|overlay"}) * 100 > 95
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Root disk above 95% on {{ $labels.instance }}"
+          description: "The root filesystem is {{ $value | printf \"%.1f\" }}% full."
+
+      - alert: ServiceDown
+        expr: up{job="shop"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service {{ $labels.job }} is down on {{ $labels.instance }}"
+          description: "The {{ $labels.job }} service on {{ $labels.instance }} does not answer health checks. The monitoring system itself is working."
