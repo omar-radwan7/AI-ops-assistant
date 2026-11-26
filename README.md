@@ -6,6 +6,8 @@ It runs next to your apps on any Linux server with Docker. It is built with n8n,
 
 ![Incident email](docs/images/email-report.png)
 
+Short overview in 8 slides: [docs/presentation/AI_Ops_Assistant.pdf](docs/presentation/AI_Ops_Assistant.pdf)
+
 ## Contents
 
 - [Why](#why)

@@ -1,3 +1,11 @@
 .env
 .env.*
 !.env.example
+
+# LaTeX build files
+*.aux
+*.log
+*.nav
+*.out
+*.snm
+*.toc
