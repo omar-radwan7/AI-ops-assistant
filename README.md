@@ -164,7 +164,7 @@ All settings live in `.env`. After a change, run `./install.sh` again.
 | `SMTP_HOST`, `SMTP_PORT` | `smtp.gmail.com`, `465` | Mail server. Port 465 uses SSL/TLS. |
 | `SMTP_USER`, `SMTP_PASSWORD` | | Mail login. For Gmail an app password. |
 | `IGNORE_APPS` | `ai-ops-assistant` | Compose projects that are never watched, comma separated |
-| `APP_LABELS` | | Short names for the email subject, for example `my-shop-prod=shop,student-platform=students` |
+| `APP_LABELS` | | Short names for the email subject, for example `my-shop-prod=shop,blog=blog` |
 | `SCAN_EVERY_MINUTES` | `1` | How often to scan (1 to 60) |
 | `TIMEZONE` | `Europe/Berlin` | Time zone for the times in the emails |
 | `AI_INVESTIGATION` | `off` | `off` or `local` (see below) |
